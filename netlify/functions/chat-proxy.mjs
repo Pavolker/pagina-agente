@@ -102,18 +102,71 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
     // ── Abrir WebSocket ──
     const ws = new WebSocket(gatewayUrl);
     let connected = false;
+    let challengeNonce = null;
     let currentRunId = null;
     let responseText = "";
     let responseState = null;
+    let pongTimeout = null;
 
     function cleanup() {
+      if (pongTimeout) clearTimeout(pongTimeout);
       clearTimeout(timer);
       try { ws.close(); } catch {}
     }
 
+    function pong() {
+      if (pongTimeout) clearTimeout(pongTimeout);
+      pongTimeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("Timeout sem resposta do Gateway"));
+      }, 20000);
+    }
+
+    function doConnect() {
+      if (connected) return;
+      connected = true;
+      const nonce = challengeNonce || "";
+      const payload = {
+        type: "req",
+        id: generateId(),
+        method: "connect",
+        params: {
+          minProtocol: 4,
+          maxProtocol: 4,
+          client: {
+            id: clientId,
+            displayName: "Gabinete Filosófico (Proxy)",
+            version: "1.0.0",
+            platform: "server",
+            mode: "webchat",
+          },
+          caps: ["tool-events"],
+          role: "operator",
+          scopes: [
+            "operator.admin",
+            "operator.read",
+            "operator.write",
+          ],
+          device: {
+            id: clientId,
+            nonce,
+          },
+          auth: {
+            token,
+          },
+          locale: "pt-BR",
+          userAgent: "Netlify-Function/1.0",
+        },
+      };
+      ws.send(JSON.stringify(payload));
+    }
+
     ws.on("open", () => {
-      // Etapa 1: Autenticar (connect)
-      sendConnect(ws, { token, clientId });
+      pong();
+      // Se nenhum challenge chegar em 1s, tenta conectar mesmo assim
+      setTimeout(() => {
+        if (!connected) doConnect();
+      }, 1000);
     });
 
     ws.on("message", (raw) => {
@@ -121,54 +174,78 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
       try {
         frame = JSON.parse(raw.toString());
       } catch {
-        return; // ignora frames não-JSON
+        return;
+      }
+
+      // ── connect.challenge ──
+      if (frame.type === "event" && frame.event === "connect.challenge") {
+        challengeNonce = frame.payload?.nonce || null;
+        if (!connected) doConnect();
+        return;
       }
 
       // ── hello-ok: conexão estabelecida ──
-      if (frame.type === "hello-ok") {
-        connected = true;
-        console.log("[chat-proxy] Conectado ao Gateway");
-
-        // Etapa 2: Carregar histórico (opcional)
-        // TODO: usar chat.history se quiser contexto
-
-        // Etapa 3: Enviar mensagem
-        sendChatMessage(ws, { sessionKey, message });
+      if (
+        frame.type === "res" &&
+        frame.method === "connect" &&
+        frame.ok === true
+      ) {
+        pong();
+        console.log("[chat-proxy] Conectado ao Gateway, enviando mensagem...");
+        // Enviar mensagem
+        const chatPayload = {
+          type: "req",
+          id: generateId(),
+          method: "chat.send",
+          params: {
+            sessionKey,
+            message,
+            idempotencyKey: generateId(),
+          },
+        };
+        ws.send(JSON.stringify(chatPayload));
         return;
       }
 
-      // ── Resposta a request ──
-      if (frame.id && frame.ok !== undefined) {
-        // Confirmação de chat.send — pegar runId se houver
-        if (frame.result && frame.result.runId) {
-          currentRunId = frame.result.runId;
+      // ── Resposta com erro ──
+      if (frame.type === "res" && frame.id) {
+        pong();
+        if (frame.ok === false || frame.error) {
+          cleanup();
+          reject(
+            new Error(
+              (frame.error && frame.error.message) ||
+                frame.error?.code ||
+                "Erro do Gateway"
+            )
+          );
+          return;
         }
-        return;
-      }
-
-      // ── Erro em request ──
-      if (frame.id && frame.error) {
-        cleanup();
-        reject(new Error(frame.error.message || "Erro do Gateway"));
+        // Confirmação de chat.send — pegar runId
+        if (frame.method === "chat.send" && frame.payload?.runId) {
+          currentRunId = frame.payload.runId;
+        }
         return;
       }
 
       // ── Evento de chat (streaming) ──
       if (frame.type === "event" && frame.event === "chat" && frame.payload) {
         const p = frame.payload;
-        const state = p.state;
+        const state = p.state || p.status;
         const runId = p.runId;
 
         if (!runId) return;
         if (!currentRunId) currentRunId = runId;
 
         if (state === "delta" && typeof p.deltaText === "string") {
+          pong();
           responseText += p.deltaText;
         }
 
         if (state === "final") {
           responseState = "final";
-          const finalText = extractText(p.message) || responseText;
+          const finalText =
+            extractText(p.message) || responseText;
           if (runId === currentRunId) {
             cleanup();
             resolve(finalText);
@@ -177,7 +254,11 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
 
         if (state === "aborted" || state === "error") {
           responseState = state;
-          const errText = p.errorMessage || p.deltaText || responseText || "Resposta interrompida";
+          const errText =
+            p.errorMessage ||
+            p.deltaText ||
+            responseText ||
+            "Resposta interrompida";
           cleanup();
           reject(new Error(errText));
         }
@@ -192,58 +273,14 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
     ws.on("close", (code, reason) => {
       if (!responseState) {
         cleanup();
-        reject(new Error(`Conexão fechada (${code}): ${reason || "sem motivo"}`));
+        reject(
+          new Error(
+            `Conexão fechada (${code}): ${reason || "sem motivo"}`
+          )
+        );
       }
     });
   });
-}
-
-// ── Enviar mensagem de connect ─────────────────
-
-function sendConnect(ws, { token, clientId }) {
-  const payload = {
-    id: generateId(),
-    method: "connect",
-    params: {
-      minProtocol: 4,
-      maxProtocol: 4,
-      client: {
-        id: clientId,
-        displayName: "Gabinete Filosófico (Proxy)",
-        version: "1.0.0",
-        platform: "server",
-        mode: "webchat",
-      },
-      caps: ["tool-events"],
-      role: "operator",
-      scopes: [
-        "operator.admin",
-        "operator.read",
-        "operator.write",
-      ],
-      auth: {
-        token,
-      },
-      locale: "pt-BR",
-      userAgent: "Netlify-Function/1.0",
-    },
-  };
-  ws.send(JSON.stringify(payload));
-}
-
-// ── Enviar mensagem de chat ───────────────────
-
-function sendChatMessage(ws, { sessionKey, message }) {
-  const payload = {
-    id: generateId(),
-    method: "chat.send",
-    params: {
-      sessionKey,
-      message,
-      idempotencyKey: generateId(),
-    },
-  };
-  ws.send(JSON.stringify(payload));
 }
 
 // ── Utilitários ───────────────────────────────

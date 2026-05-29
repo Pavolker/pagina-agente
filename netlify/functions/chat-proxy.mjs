@@ -100,7 +100,11 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
     }, RESPONSE_TIMEOUT_MS);
 
     // ── Abrir WebSocket ──
-    const ws = new WebSocket(gatewayUrl);
+    const ws = new WebSocket(gatewayUrl, {
+      headers: {
+        Origin: "https://agente-pv.netlify.app",
+      },
+    });
     let connected = false;
     let challengeNonce = null;
     let currentRunId = null;

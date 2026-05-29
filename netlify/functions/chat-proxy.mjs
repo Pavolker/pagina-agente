@@ -91,7 +91,13 @@ export const handler = async (event) => {
 
 // ── Função principal de comunicação ────────────
 
-async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, message }) {
+async function chatWithGateway({
+  gatewayUrl,
+  token,
+  clientId,
+  sessionKey,
+  message,
+}) {
   return new Promise((resolve, reject) => {
     // ── Timeout global ──
     const timer = setTimeout(() => {
@@ -105,35 +111,40 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
         Origin: "https://agente-pv.netlify.app",
       },
     });
-    let connected = false;
-    let challengeNonce = null;
+
     let currentRunId = null;
     let responseText = "";
     let responseState = null;
-    let pongTimeout = null;
+    let connected = false;
+
+    // pending: id -> { resolve, reject }
+    const pending = new Map();
 
     function cleanup() {
-      if (pongTimeout) clearTimeout(pongTimeout);
       clearTimeout(timer);
-      try { ws.close(); } catch {}
+      try {
+        ws.close();
+      } catch {}
     }
 
-    function pong() {
-      if (pongTimeout) clearTimeout(pongTimeout);
-      pongTimeout = setTimeout(() => {
-        cleanup();
-        reject(new Error("Timeout sem resposta do Gateway"));
-      }, 20000);
+    function sendRequest(method, params) {
+      return new Promise((resolveReq, rejectReq) => {
+        const id = generateId();
+        const frame = { type: "req", id, method, params };
+        pending.set(id, { resolve: resolveReq, reject: rejectReq });
+        try {
+          ws.send(JSON.stringify(frame));
+        } catch (err) {
+          pending.delete(id);
+          rejectReq(err);
+        }
+      });
     }
 
-    function doConnect() {
-      if (connected) return;
+    async function doConnect() {
       connected = true;
-      const payload = {
-        type: "req",
-        id: generateId(),
-        method: "connect",
-        params: {
+      try {
+        await sendRequest("connect", {
           minProtocol: 4,
           maxProtocol: 4,
           client: {
@@ -145,27 +156,31 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
           },
           caps: ["tool-events"],
           role: "operator",
-          scopes: [
-            "operator.admin",
-            "operator.read",
-            "operator.write",
-          ],
-          auth: {
-            token,
-          },
+          scopes: ["operator.admin", "operator.read", "operator.write"],
+          auth: { token },
           locale: "pt-BR",
           userAgent: "Netlify-Function/1.0",
-        },
-      };
-      ws.send(JSON.stringify(payload));
+        });
+        console.log("[chat-proxy] Conectado ao Gateway");
+
+        // Agora envia a mensagem
+        const result = await sendRequest("chat.send", {
+          sessionKey,
+          message,
+          idempotencyKey: generateId(),
+        });
+        console.log("[chat-proxy] Mensagem enviada");
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
     }
 
     ws.on("open", () => {
-      pong();
-      // Se nenhum challenge chegar em 1s, tenta conectar mesmo assim
+      // Fallback: se challenge não chegar, conecta após 3s
       setTimeout(() => {
         if (!connected) doConnect();
-      }, 1000);
+      }, 3000);
     });
 
     ws.on("message", (raw) => {
@@ -178,51 +193,23 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
 
       // ── connect.challenge ──
       if (frame.type === "event" && frame.event === "connect.challenge") {
-        challengeNonce = frame.payload?.nonce || null;
         if (!connected) doConnect();
         return;
       }
 
-      // ── hello-ok: conexão estabelecida ──
-      if (
-        frame.type === "res" &&
-        frame.method === "connect" &&
-        frame.ok === true
-      ) {
-        pong();
-        console.log("[chat-proxy] Conectado ao Gateway, enviando mensagem...");
-        // Enviar mensagem
-        const chatPayload = {
-          type: "req",
-          id: generateId(),
-          method: "chat.send",
-          params: {
-            sessionKey,
-            message,
-            idempotencyKey: generateId(),
-          },
-        };
-        ws.send(JSON.stringify(chatPayload));
-        return;
-      }
-
-      // ── Resposta com erro ──
-      if (frame.type === "res" && frame.id) {
-        pong();
-        if (frame.ok === false || frame.error) {
-          cleanup();
-          reject(
-            new Error(
-              (frame.error && frame.error.message) ||
-                frame.error?.code ||
-                "Erro do Gateway"
-            )
-          );
-          return;
-        }
-        // Confirmação de chat.send — pegar runId
-        if (frame.method === "chat.send" && frame.payload?.runId) {
-          currentRunId = frame.payload.runId;
+      // ── Resposta a request (por id) ──
+      if (frame.type === "res" && typeof frame.id === "string") {
+        const pendingReq = pending.get(frame.id);
+        if (!pendingReq) return;
+        pending.delete(frame.id);
+        if (frame.ok) {
+          pendingReq.resolve(frame.payload);
+        } else {
+          const errMsg =
+            (frame.error && frame.error.message) ||
+            (frame.error && frame.error.code) ||
+            "Erro do Gateway";
+          pendingReq.reject(new Error(errMsg));
         }
         return;
       }
@@ -237,14 +224,12 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
         if (!currentRunId) currentRunId = runId;
 
         if (state === "delta" && typeof p.deltaText === "string") {
-          pong();
           responseText += p.deltaText;
         }
 
         if (state === "final") {
           responseState = "final";
-          const finalText =
-            extractText(p.message) || responseText;
+          const finalText = extractText(p.message) || responseText;
           if (runId === currentRunId) {
             cleanup();
             resolve(finalText);
@@ -273,9 +258,7 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
       if (!responseState) {
         cleanup();
         reject(
-          new Error(
-            `Conexão fechada (${code}): ${reason || "sem motivo"}`
-          )
+          new Error(`Conexão fechada (${code}): ${reason || "sem motivo"}`)
         );
       }
     });
@@ -295,13 +278,20 @@ function extractText(value) {
   if (typeof value === "string") return value.trim() || null;
   if (!value || typeof value !== "object") return null;
 
-  if (typeof value.deltaText === "string") return value.deltaText.trim() || null;
+  if (typeof value.deltaText === "string")
+    return value.deltaText.trim() || null;
   if (typeof value.text === "string") return value.text.trim() || null;
   if (typeof value.content === "string") return value.content.trim() || null;
 
   if (Array.isArray(value.content)) {
     const parts = value.content
-      .filter((p) => p && typeof p === "object" && p.type === "text" && typeof p.text === "string")
+      .filter(
+        (p) =>
+          p &&
+          typeof p === "object" &&
+          p.type === "text" &&
+          typeof p.text === "string"
+      )
       .map((p) => p.text.trim());
     return parts.length ? parts.join("\n") : null;
   }

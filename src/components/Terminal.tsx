@@ -21,6 +21,9 @@ import {
   type OpenClawHelloOk,
 } from '../lib/openclaw';
 
+const CHAT_PROXY_URL = import.meta.env.VITE_OPENCLAW_CHAT_PROXY || '/.netlify/functions/chat-proxy';
+const USE_PROXY = String(import.meta.env.VITE_OPENCLAW_USE_PROXY ?? 'false') === 'true';
+
 type UiMessage = {
   id: string;
   role: 'user' | 'assistant';
@@ -461,8 +464,66 @@ export const Terminal: React.FC = () => {
   }
 
   async function sendMessage() {
-    const client = clientRef.current;
     const text = draft.trim();
+
+    if (USE_PROXY) {
+      // ── Modo proxy HTTP (Netlify Function) ──
+      if (!text || isSending) return;
+      setDraft('');
+      const timestamp = Date.now();
+      const msgId = `proxy-${timestamp}`;
+      const userMessage: UiMessage = {
+        id: `local-user-${timestamp}`,
+        role: 'user',
+        text,
+        timestamp,
+        status: 'final',
+      };
+      setMessages((current) => [...current, userMessage, {
+        id: msgId,
+        role: 'assistant',
+        text: 'Processando...',
+        timestamp: timestamp + 1,
+        status: 'pending',
+      }]);
+      setIsSending(true);
+      setLastError(null);
+
+      try {
+        const res = await fetch(CHAT_PROXY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, sessionKey: activeSessionKeyRef.current }),
+        });
+        if (!res.ok) {
+          throw new Error(`Proxy retornou ${res.status}: ${await res.text()}`);
+        }
+        const data = await res.json() as { reply?: string };
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === msgId
+              ? { ...message, text: data.reply ?? '[resposta vazia]', status: 'final' as const }
+              : message,
+          ),
+        );
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        setLastError(errorMsg);
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === msgId
+              ? { ...message, text: `Erro: ${errorMsg}`, status: 'error' as const }
+              : message,
+          ),
+        );
+      } finally {
+        setIsSending(false);
+      }
+      return;
+    }
+
+    // ── Modo WebSocket direto (original) ──
+    const client = clientRef.current;
     if (!client?.connected || !text || isSending || activeRunIdRef.current) {
       return;
     }
@@ -576,24 +637,49 @@ export const Terminal: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="font-serif text-lg text-ivory">OpenClaw Chat</h2>
-                <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.28em] ${terminalStatusPill}`}>
-                  {statusLabel}
-                </span>
+                {USE_PROXY ? (
+                  <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.28em] text-emerald-300">
+                    PROXY
+                  </span>
+                ) : (
+                  <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.28em] ${terminalStatusPill}`}>
+                    {statusLabel}
+                  </span>
+                )}
               </div>
               <p className="font-mono text-[10px] uppercase tracking-[0.32em] text-ivory/35">
-                Gateway WS + chat.history + chat.send + chat.abort
+                {USE_PROXY ? 'HTTP proxy via Netlify Function' : 'Gateway WS + chat.history + chat.send + chat.abort'}
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.25em] text-ivory/35">
-            {serverVersion ? <span>v{serverVersion}</span> : null}
-            {serverConnectionId ? <span>#{serverConnectionId.slice(0, 6)}</span> : null}
+            {USE_PROXY ? <span>proxy mode</span> : null}
+            {!USE_PROXY && serverVersion ? <span>v{serverVersion}</span> : null}
+            {!USE_PROXY && serverConnectionId ? <span>#{serverConnectionId.slice(0, 6)}</span> : null}
           </div>
         </div>
       </div>
 
       <div className="border-b border-gold/10 bg-void/35 px-4 py-3">
-        <div className="grid gap-3 md:grid-cols-[1.3fr_0.7fr]">
+        {USE_PROXY ? (
+          <div className="flex flex-col gap-2">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] font-mono uppercase tracking-[0.28em] text-ivory/40">Session key</span>
+              <input
+                value={form.sessionKey}
+                onChange={(event) => setForm((current) => ({ ...current, sessionKey: event.target.value }))}
+                className="rounded-lg border border-gold/15 bg-ivory/5 px-3 py-2 font-mono text-sm text-gold outline-none transition focus:border-gold/40"
+                placeholder="main"
+              />
+            </label>
+            <div className="flex items-center gap-2 text-[11px] font-mono text-emerald-300/80">
+              <div className="h-2 w-2 rounded-full bg-emerald-400" />
+              Modo proxy ativo — token seguro no servidor
+            </div>
+          </div>
+        ) : (
+        <>
+          <div className="grid gap-3 md:grid-cols-[1.3fr_0.7fr]">
           <label className="flex flex-col gap-1">
             <span className="text-[10px] font-mono uppercase tracking-[0.28em] text-ivory/40">Gateway URL</span>
             <input
@@ -705,6 +791,8 @@ export const Terminal: React.FC = () => {
         <p className="mt-3 text-[10px] leading-relaxed text-ivory/30">
           Se o gateway recusar a conexão por origem, adicione o domínio publicado do Netlify em <span className="text-gold">gateway.controlUi.allowedOrigins</span> no OpenClaw.
         </p>
+        </>
+      )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
@@ -791,13 +879,13 @@ export const Terminal: React.FC = () => {
                 void sendMessage();
               }
             }}
-            placeholder={clientRef.current?.connected ? 'Digite sua pergunta...' : 'Conecte o gateway para conversar...'}
+            placeholder={USE_PROXY ? 'Digite sua pergunta...' : clientRef.current?.connected ? 'Digite sua pergunta...' : 'Conecte o gateway para conversar...'}
             className="min-h-[52px] flex-1 resize-none rounded-2xl border border-ivory/10 bg-ivory/5 px-4 py-3 font-mono text-sm text-ivory outline-none transition placeholder:text-ivory/25 focus:border-gold/35"
           />
           <button
             type="button"
             onClick={() => void sendMessage()}
-            disabled={!clientRef.current?.connected || !draft.trim() || isSending || Boolean(activeRunId)}
+            disabled={USE_PROXY ? (!draft.trim() || isSending) : (!clientRef.current?.connected || !draft.trim() || isSending || Boolean(activeRunId))}
             className="inline-flex h-[52px] min-w-[52px] items-center justify-center rounded-2xl border border-gold/20 bg-gold/10 text-gold transition hover:bg-gold/15 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {isSending ? <LoaderCircle size={18} className="animate-spin" /> : <Send size={18} />}

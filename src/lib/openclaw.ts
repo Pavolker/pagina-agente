@@ -1,3 +1,12 @@
+import {
+  buildDeviceAuthPayloadV3,
+  clearDeviceAuthToken,
+  loadDeviceAuthToken,
+  loadOrCreateDeviceIdentity,
+  signDevicePayload,
+  storeDeviceAuthToken,
+} from "./browser-device";
+
 export const OPENCLAW_PROTOCOL_VERSION = 4 as const;
 export const OPENCLAW_MIN_PROTOCOL_VERSION = 4 as const;
 
@@ -104,8 +113,16 @@ type ConnectParams = {
   caps: string[];
   role: string;
   scopes: string[];
+  device?: {
+    id: string;
+    publicKey: string;
+    signature: string;
+    signedAt: number;
+    nonce: string;
+  };
   auth?: {
     token?: string;
+    deviceToken?: string;
     password?: string;
   };
   locale: string;
@@ -394,6 +411,25 @@ export class OpenClawChatClient {
     this.connectSent = true;
     this.clearConnectTimer();
 
+    const deviceIdentity = await loadOrCreateDeviceIdentity();
+    const storedDeviceAuth = loadDeviceAuthToken({ deviceId: deviceIdentity.deviceId, role: "operator" });
+    const explicitToken = this.options.token?.trim() || undefined;
+    const explicitPassword = this.options.password?.trim() || undefined;
+    const resolvedToken = explicitToken ?? (!explicitToken && !explicitPassword ? storedDeviceAuth?.token : undefined);
+    const signedAtMs = Date.now();
+    const nonce = this.connectNonce ?? "";
+    const payload = buildDeviceAuthPayloadV3({
+      deviceId: deviceIdentity.deviceId,
+      clientId: this.options.clientId?.trim() || "gabinete-filosofo",
+      clientMode: this.options.mode ?? "webchat",
+      role: "operator",
+      scopes: [...OPENCLAW_CONTROL_SCOPES],
+      signedAtMs,
+      token: resolvedToken ?? null,
+      nonce,
+      platform: this.options.platform?.trim() || navigator.platform || "web",
+    });
+    const signature = await signDevicePayload(deviceIdentity.privateKey, payload);
     const connectParams: ConnectParams = {
       minProtocol: OPENCLAW_MIN_PROTOCOL_VERSION,
       maxProtocol: OPENCLAW_PROTOCOL_VERSION,
@@ -407,16 +443,26 @@ export class OpenClawChatClient {
       caps: ["tool-events"],
       role: "operator",
       scopes: [...OPENCLAW_CONTROL_SCOPES],
+      device: {
+        id: deviceIdentity.deviceId,
+        publicKey: deviceIdentity.publicKey,
+        signature,
+        signedAt: signedAtMs,
+        nonce,
+      },
       locale: navigator.language,
       userAgent: navigator.userAgent,
     };
 
-    const token = this.options.token?.trim() || "";
-    const password = this.options.password?.trim() || "";
-    if (token || password) {
+    const token = explicitToken ?? "";
+    const password = explicitPassword ?? "";
+    if (token || password || storedDeviceAuth?.token) {
       connectParams.auth = {};
       if (token) {
         connectParams.auth.token = token;
+      }
+      if (!token && !password && storedDeviceAuth?.token) {
+        connectParams.auth.deviceToken = storedDeviceAuth.token;
       }
       if (password) {
         connectParams.auth.password = password;
@@ -430,10 +476,21 @@ export class OpenClawChatClient {
       }
       this.pendingConnectError = undefined;
       this.reconnectDelayMs = 800;
+      if (typeof hello.auth?.deviceToken === "string" && hello.auth.deviceToken.trim()) {
+        storeDeviceAuthToken({
+          deviceId: deviceIdentity.deviceId,
+          role: hello.auth.role || "operator",
+          token: hello.auth.deviceToken,
+          scopes: Array.isArray(hello.auth.scopes) ? hello.auth.scopes : [],
+        });
+      }
       this.options.onHello?.(hello);
       this.options.onStatus?.("connected");
     } catch (err) {
       this.pendingConnectError = toRequestErrorInfo(err);
+      if (this.pendingConnectError.code === "AUTH_DEVICE_TOKEN_MISMATCH") {
+        clearDeviceAuthToken({ deviceId: deviceIdentity.deviceId, role: "operator" });
+      }
       this.options.onStatus?.("disconnected");
       socket.close(1008, "connect failed");
     }

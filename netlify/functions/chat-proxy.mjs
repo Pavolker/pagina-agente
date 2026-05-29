@@ -133,7 +133,7 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
           minProtocol: 4,
           maxProtocol: 4,
           client: {
-            id: "gabinete-filosofo",
+            id: "gateway-client",
             displayName: "Gabinete Filosófico (Proxy)",
             version: "1.0.0",
             platform: "server",

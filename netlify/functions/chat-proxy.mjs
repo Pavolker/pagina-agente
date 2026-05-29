@@ -3,20 +3,18 @@
 // netlify/functions/chat-proxy.mjs
 //
 // Recebe mensagens do frontend via HTTP POST,
-// autentica com o Gateway OpenClaw via WebSocket
+// encaminha para o Gateway via HTTP API (/v1/responses)
 // usando o token mestre (env var), e retorna a
 // resposta completa.
 //
 // Variáveis de ambiente (Netlify):
-//   OPENCLAW_GATEWAY_URL    — wss:// do Gateway
+//   OPENCLAW_GATEWAY_URL    — URL do Gateway (ex: https://agentepv-production.up.railway.app)
 //   OPENCLAW_GATEWAY_TOKEN  — token de autenticação
 // ──────────────────────────────────────────────
 
-import WebSocket from "ws";
-
 // ── Constantes ────────────────────────────────
 
-const RESPONSE_TIMEOUT_MS = 30_000; // timeout total por request
+const RESPONSE_TIMEOUT_MS = 25_000; // timeout total
 
 // ── Handler principal ─────────────────────────
 
@@ -48,9 +46,8 @@ export const handler = async (event) => {
   // ── 3. Ler configuração do ambiente ──
   const GATEWAY_URL =
     process.env.OPENCLAW_GATEWAY_URL ||
-    "wss://agentepv-production.up.railway.app";
+    "https://agentepv-production.up.railway.app";
   const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN;
-  const CLIENT_ID = "gabinete-filosofo-proxy";
 
   if (!GATEWAY_TOKEN) {
     return {
@@ -62,12 +59,20 @@ export const handler = async (event) => {
     };
   }
 
-  // ── 4. Executar a conversa via WebSocket ──
+  // ── 4. Enviar via HTTP API do Gateway ──
+
+  // Extrair base URL (remover wss:// caso tenha sido configurado assim)
+  const baseUrl = GATEWAY_URL
+    .replace(/^wss:\/\//, "https://")
+    .replace(/^ws:\/\//, "http://")
+    .replace(/\/+$/, "");
+
+  const apiUrl = `${baseUrl}/v1/responses`;
+
   try {
-    const reply = await chatWithGateway({
-      gatewayUrl: GATEWAY_URL,
+    const reply = await sendViaHttpApi({
+      apiUrl,
       token: GATEWAY_TOKEN,
-      clientId: CLIENT_ID,
       sessionKey,
       message: message.trim(),
     });
@@ -89,210 +94,67 @@ export const handler = async (event) => {
   }
 };
 
-// ── Função principal de comunicação ────────────
+// ── Envio via HTTP API (OpenResponses) ─────────
 
-async function chatWithGateway({
-  gatewayUrl,
-  token,
-  clientId,
-  sessionKey,
-  message,
-}) {
-  return new Promise((resolve, reject) => {
-    // ── Timeout global ──
-    const timer = setTimeout(() => {
-      ws.close();
-      reject(new Error("Timeout ao aguardar resposta do Gateway"));
-    }, RESPONSE_TIMEOUT_MS);
+async function sendViaHttpApi({ apiUrl, token, sessionKey, message }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RESPONSE_TIMEOUT_MS);
 
-    // ── Abrir WebSocket ──
-    const ws = new WebSocket(gatewayUrl, {
+  try {
+    const response = await fetch(apiUrl, {
+      method: "POST",
       headers: {
-        Origin: "https://agente-pv.netlify.app",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "x-openclaw-session-key": sessionKey,
       },
+      body: JSON.stringify({
+        model: "openclaw/main",
+        input: message,
+      }),
+      signal: controller.signal,
     });
 
-    let currentRunId = null;
-    let responseText = "";
-    let responseState = null;
-    let connected = false;
-
-    // pending: id -> { resolve, reject }
-    const pending = new Map();
-
-    function cleanup() {
-      clearTimeout(timer);
-      try {
-        ws.close();
-      } catch {}
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      throw new Error(
+        `Gateway HTTP ${response.status}: ${errorBody.slice(0, 500)}`
+      );
     }
 
-    function sendRequest(method, params) {
-      return new Promise((resolveReq, rejectReq) => {
-        const id = generateId();
-        const frame = { type: "req", id, method, params };
-        pending.set(id, { resolve: resolveReq, reject: rejectReq });
-        try {
-          ws.send(JSON.stringify(frame));
-        } catch (err) {
-          pending.delete(id);
-          rejectReq(err);
-        }
-      });
+    const data = await response.json();
+
+    // Extrair texto da resposta no formato OpenResponses
+    const replyText = extractResponseText(data);
+
+    if (!replyText) {
+      throw new Error("Gateway retornou resposta vazia");
     }
 
-    async function doConnect() {
-      connected = true;
-      try {
-        await sendRequest("connect", {
-          minProtocol: 4,
-          maxProtocol: 4,
-          client: {
-            id: "gateway-client",
-            displayName: "Gabinete Filosófico (Proxy)",
-            version: "1.0.0",
-            platform: "server",
-            mode: "webchat",
-          },
-          caps: ["tool-events"],
-          role: "operator",
-          auth: { token },
-          locale: "pt-BR",
-          userAgent: "Netlify-Function/1.0",
-        });
-        console.log("[chat-proxy] Conectado ao Gateway");
-
-        // Agora envia a mensagem
-        const result = await sendRequest("chat.send", {
-          sessionKey,
-          message,
-          idempotencyKey: generateId(),
-        });
-        console.log("[chat-proxy] Mensagem enviada");
-      } catch (err) {
-        cleanup();
-        reject(err);
-      }
-    }
-
-    ws.on("open", () => {
-      // Fallback: se challenge não chegar, conecta após 3s
-      setTimeout(() => {
-        if (!connected) doConnect();
-      }, 3000);
-    });
-
-    ws.on("message", (raw) => {
-      let frame;
-      try {
-        frame = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-
-      // ── connect.challenge ──
-      if (frame.type === "event" && frame.event === "connect.challenge") {
-        if (!connected) doConnect();
-        return;
-      }
-
-      // ── Resposta a request (por id) ──
-      if (frame.type === "res" && typeof frame.id === "string") {
-        const pendingReq = pending.get(frame.id);
-        if (!pendingReq) return;
-        pending.delete(frame.id);
-        if (frame.ok) {
-          pendingReq.resolve(frame.payload);
-        } else {
-          const errMsg =
-            (frame.error && frame.error.message) ||
-            (frame.error && frame.error.code) ||
-            "Erro do Gateway";
-          pendingReq.reject(new Error(errMsg));
-        }
-        return;
-      }
-
-      // ── Evento de chat (streaming) ──
-      if (frame.type === "event" && frame.event === "chat" && frame.payload) {
-        const p = frame.payload;
-        const state = p.state || p.status;
-        const runId = p.runId;
-
-        if (!runId) return;
-        if (!currentRunId) currentRunId = runId;
-
-        if (state === "delta" && typeof p.deltaText === "string") {
-          responseText += p.deltaText;
-        }
-
-        if (state === "final") {
-          responseState = "final";
-          const finalText = extractText(p.message) || responseText;
-          if (runId === currentRunId) {
-            cleanup();
-            resolve(finalText);
-          }
-        }
-
-        if (state === "aborted" || state === "error") {
-          responseState = state;
-          const errText =
-            p.errorMessage ||
-            p.deltaText ||
-            responseText ||
-            "Resposta interrompida";
-          cleanup();
-          reject(new Error(errText));
-        }
-      }
-    });
-
-    ws.on("error", (err) => {
-      cleanup();
-      reject(new Error(`Erro no WebSocket: ${err.message}`));
-    });
-
-    ws.on("close", (code, reason) => {
-      if (!responseState) {
-        cleanup();
-        reject(
-          new Error(`Conexão fechada (${code}): ${reason || "sem motivo"}`)
-        );
-      }
-    });
-  });
-}
-
-// ── Utilitários ───────────────────────────────
-
-function generateId() {
-  if (typeof crypto !== "undefined" && crypto.randomUUID) {
-    return crypto.randomUUID();
+    return replyText;
+  } finally {
+    clearTimeout(timer);
   }
-  return `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function extractText(value) {
-  if (typeof value === "string") return value.trim() || null;
-  if (!value || typeof value !== "object") return null;
+// ── Extrair texto da resposta OpenResponses ────
 
-  if (typeof value.deltaText === "string")
-    return value.deltaText.trim() || null;
-  if (typeof value.text === "string") return value.text.trim() || null;
-  if (typeof value.content === "string") return value.content.trim() || null;
+function extractResponseText(data) {
+  // Formato: { output: [ { role: "assistant", content: [ { type: "text", text: "..." } ] } ] }
+  if (data?.output && Array.isArray(data.output)) {
+    for (const item of data.output) {
+      if (item.role === "assistant" && Array.isArray(item.content)) {
+        const parts = item.content
+          .filter((p) => p.type === "text" && typeof p.text === "string")
+          .map((p) => p.text.trim());
+        if (parts.length) return parts.join("\n");
+      }
+    }
+  }
 
-  if (Array.isArray(value.content)) {
-    const parts = value.content
-      .filter(
-        (p) =>
-          p &&
-          typeof p === "object" &&
-          p.type === "text" &&
-          typeof p.text === "string"
-      )
-      .map((p) => p.text.trim());
-    return parts.length ? parts.join("\n") : null;
+  // Fallback: se tiver output_text
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
   }
 
   return null;

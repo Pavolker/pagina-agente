@@ -125,7 +125,6 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
     function doConnect() {
       if (connected) return;
       connected = true;
-      const nonce = challengeNonce || "";
       const payload = {
         type: "req",
         id: generateId(),
@@ -134,7 +133,7 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
           minProtocol: 4,
           maxProtocol: 4,
           client: {
-            id: clientId,
+            id: "gabinete-filosofo",
             displayName: "Gabinete Filosófico (Proxy)",
             version: "1.0.0",
             platform: "server",
@@ -147,10 +146,6 @@ async function chatWithGateway({ gatewayUrl, token, clientId, sessionKey, messag
             "operator.read",
             "operator.write",
           ],
-          device: {
-            id: clientId,
-            nonce,
-          },
           auth: {
             token,
           },

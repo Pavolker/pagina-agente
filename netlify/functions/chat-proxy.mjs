@@ -156,7 +156,6 @@ async function chatWithGateway({
           },
           caps: ["tool-events"],
           role: "operator",
-          scopes: ["operator.admin", "operator.read", "operator.write"],
           auth: { token },
           locale: "pt-BR",
           userAgent: "Netlify-Function/1.0",

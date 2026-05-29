@@ -1,0 +1,6 @@
+{
+  "name": "Gabinete Filosófico",
+  "description": "Interface pública para conversar com um agente OpenClaw.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

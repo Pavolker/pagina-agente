@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  --font-serif: "Baskerville", "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --font-sans: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+
+  --color-gold: #e9c176;
+  --color-gold-muted: #6d3a00;
+  --color-copper: #ad6a2b;
+  --color-ivory: #e5e2dc;
+  --color-charcoal: #131410;
+  --color-void: #0e0e0b;
+
+  --radius-soft: 4px;
+}
+
+@layer base {
+  body {
+    @apply bg-charcoal text-ivory font-sans selection:bg-gold/30 selection:text-gold;
+    cursor: default;
+  }
+
+  h1, h2, h3, h4 {
+    @apply font-serif tracking-tight;
+  }
+
+  /* Custom Scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-void;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gold/10 hover:bg-gold/30 transition-colors rounded-full;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-ivory/5 backdrop-blur-xl border border-ivory/10;
+  }
+  
+  .glass-gold {
+    @apply bg-gold/5 backdrop-blur-xl border border-gold/10;
+  }
+
+  .bloom {
+    box-shadow: 0 0 24px rgba(233, 193, 118, 0.08);
+  }
+
+  .terminal-text {
+    @apply font-mono text-sm leading-relaxed;
+  }
+}
+
+@keyframes neural-pulse {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 0.5; }
+}
+
+.animate-neural {
+  animation: neural-pulse 4s ease-in-out infinite;
+}
